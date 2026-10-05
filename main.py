@@ -1,4 +1,5 @@
 import glob
+import logging
 import math
 import os
 import shutil
@@ -11,6 +12,9 @@ import numpy as np
 from flask import Flask, Response, abort, render_template_string
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MAX_FACES = 2
+
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 
 def make_detector():
@@ -104,46 +108,68 @@ class Camera:
         self.detector = make_detector()
         self.sprites = {k: load_sprite(v["sprite"]) for k, v in MASKS.items()}
         self.current = None
-        self.face = None
-        self.last_seen = 0
+        self.tracks = []
         self.frame = None
         self.jpeg = None
         self.lock = threading.Lock()
         threading.Thread(target=self.run, daemon=True).start()
 
-    def detect_face(self, frame):
+    def detect_faces(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         scale = 0.5
         small = cv2.resize(gray, None, fx=scale, fy=scale)
-        faces = self.detector.detectMultiScale(small, 1.1, 5, minSize=(60, 60))
-        if len(faces) == 0:
-            return
-        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-        new = np.array([x, y, w, h], dtype=np.float32) / scale
-        if self.face is None:
-            self.face = new
-        else:
-            self.face = self.face * 0.7 + new * 0.3
-        self.last_seen = time.time()
+        faces = self.detector.detectMultiScale(small, 1.1, 5, minSize=(50, 50))
+        now = time.time()
+        found = [np.array(f, dtype=np.float32) / scale for f in faces]
+        found.sort(key=lambda b: b[2] * b[3], reverse=True)
+        found = found[:MAX_FACES]
+        used = set()
+        for box in found:
+            cx = box[0] + box[2] / 2
+            cy = box[1] + box[3] / 2
+            best = None
+            best_dist = None
+            for i, track in enumerate(self.tracks):
+                if i in used:
+                    continue
+                tb = track["box"]
+                dist = math.hypot(cx - (tb[0] + tb[2] / 2), cy - (tb[1] + tb[3] / 2))
+                if dist < max(tb[2], box[2]) and (best_dist is None or dist < best_dist):
+                    best = i
+                    best_dist = dist
+            if best is None:
+                self.tracks.append({"box": box, "seen": now})
+                used.add(len(self.tracks) - 1)
+            else:
+                track = self.tracks[best]
+                track["box"] = track["box"] * 0.7 + box * 0.3
+                track["seen"] = now
+                used.add(best)
+        alive = [t for t in self.tracks if now - t["seen"] <= 0.6]
+        alive.sort(key=lambda t: t["seen"], reverse=True)
+        self.tracks = alive[:MAX_FACES]
 
     def draw_mask(self, frame):
         current = self.current
         if current is None:
             return
-        if self.face is None or time.time() - self.last_seen > 0.6:
-            return
-        x, y, w, h = self.face
-        cx = x + w / 2
-        cy = y + h * 0.25
-        rx = w * 0.72
-        ry = h * 0.78
-        t = time.time() * 2.0
+        now = time.time()
         sprite = self.sprites[current]
-        for angle, radial, size, phase in MASKS[current]["layout"]:
-            a = math.radians(angle)
-            px = cx + rx * radial * math.cos(a)
-            py = cy - ry * radial * math.sin(a) + math.sin(t + phase) * h * 0.02
-            overlay(frame, sprite, px, py, w * size)
+        layout = MASKS[current]["layout"]
+        for index, track in enumerate(list(self.tracks)):
+            if now - track["seen"] > 0.6:
+                continue
+            x, y, w, h = track["box"]
+            cx = x + w / 2
+            cy = y + h * 0.25
+            rx = w * 0.72
+            ry = h * 0.78
+            t = now * 2.0 + index * 1.7
+            for angle, radial, size, phase in layout:
+                a = math.radians(angle)
+                px = cx + rx * radial * math.cos(a)
+                py = cy - ry * radial * math.sin(a) + math.sin(t + phase) * h * 0.02
+                overlay(frame, sprite, px, py, w * size)
 
     def run(self):
         while True:
@@ -152,7 +178,7 @@ class Camera:
                 time.sleep(0.05)
                 continue
             frame = cv2.flip(frame, 1)
-            self.detect_face(frame)
+            self.detect_faces(frame)
             self.draw_mask(frame)
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
             if ok:
@@ -179,6 +205,7 @@ PAGE = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>Маски для камеры</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -391,6 +418,11 @@ def snapshot():
     if png is None:
         abort(503)
     return Response(png, mimetype="image/png")
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 
 if __name__ == "__main__":
