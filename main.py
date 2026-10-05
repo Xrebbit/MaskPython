@@ -2,13 +2,13 @@ import glob
 import math
 import os
 import shutil
+import threading
 import time
-import tkinter as tk
-from tkinter import filedialog
+import webbrowser
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from flask import Flask, Response, abort, render_template_string
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,23 +26,14 @@ def make_detector():
 
 def find_sprite():
     for name in ("heart.png", "hurts.png"):
-        p = os.path.join(BASE_DIR, name)
-        if os.path.exists(p):
-            return p
+        path = os.path.join(BASE_DIR, name)
+        if os.path.exists(path):
+            return path
     files = [f for f in glob.glob(os.path.join(BASE_DIR, "*.png"))
              if not os.path.basename(f).startswith("photo_")]
     if files:
         return files[0]
-    tmp = tk.Tk()
-    tmp.withdraw()
-    p = filedialog.askopenfilename(
-        title="Выбери картинку сердца",
-        filetypes=[("Картинки", "*.png *.jpg *.jpeg *.bmp")],
-    )
-    tmp.destroy()
-    if not p:
-        raise SystemExit("Картинка не выбрана")
-    return p
+    raise SystemExit("Положи картинку сердца heart.png рядом с main.py")
 
 
 def load_sprite(path):
@@ -107,41 +98,18 @@ MASKS = {
 }
 
 
-class App:
-    def __init__(self, window):
-        self.window = window
-        window.title("Маски для камеры")
+class Camera:
+    def __init__(self):
         self.cap = cv2.VideoCapture(0)
         self.detector = make_detector()
         self.sprites = {k: load_sprite(v["sprite"]) for k, v in MASKS.items()}
         self.current = None
         self.face = None
         self.last_seen = 0
-        self.last_frame = None
-
-        self.video = tk.Label(window)
-        self.video.pack(side=tk.LEFT, padx=10, pady=10)
-
-        panel = tk.Frame(window)
-        panel.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10)
-        tk.Label(panel, text="Маски", font=("Arial", 14, "bold")).pack(pady=(0, 10))
-
-        for key, m in MASKS.items():
-            tk.Button(
-                panel, text=m["title"], width=20, height=2,
-                command=lambda k=key: self.set_mask(k),
-            ).pack(pady=4)
-
-        tk.Button(panel, text="Без маски", width=20, height=2,
-                  command=lambda: self.set_mask(None)).pack(pady=4)
-        tk.Button(panel, text="Сделать снимок", width=20, height=2,
-                  command=self.snapshot).pack(pady=(30, 4))
-
-        window.protocol("WM_DELETE_WINDOW", self.close)
-        self.update()
-
-    def set_mask(self, key):
-        self.current = key
+        self.frame = None
+        self.jpeg = None
+        self.lock = threading.Lock()
+        threading.Thread(target=self.run, daemon=True).start()
 
     def detect_face(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -159,7 +127,8 @@ class App:
         self.last_seen = time.time()
 
     def draw_mask(self, frame):
-        if self.current is None:
+        current = self.current
+        if current is None:
             return
         if self.face is None or time.time() - self.last_seen > 0.6:
             return
@@ -169,40 +138,261 @@ class App:
         rx = w * 0.72
         ry = h * 0.78
         t = time.time() * 2.0
-        mask = MASKS[self.current]
-        sprite = self.sprites[self.current]
-        for angle, radial, size, phase in mask["layout"]:
+        sprite = self.sprites[current]
+        for angle, radial, size, phase in MASKS[current]["layout"]:
             a = math.radians(angle)
             px = cx + rx * radial * math.cos(a)
             py = cy - ry * radial * math.sin(a) + math.sin(t + phase) * h * 0.02
             overlay(frame, sprite, px, py, w * size)
 
-    def update(self):
-        ok, frame = self.cap.read()
-        if ok:
+    def run(self):
+        while True:
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.05)
+                continue
             frame = cv2.flip(frame, 1)
             self.detect_face(frame)
             self.draw_mask(frame)
-            self.last_frame = frame
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = ImageTk.PhotoImage(Image.fromarray(rgb))
-            self.video.configure(image=img)
-            self.video.image = img
-        self.window.after(15, self.update)
-
-    def snapshot(self):
-        if self.last_frame is not None:
-            name = os.path.join(BASE_DIR, time.strftime("photo_%Y%m%d_%H%M%S.png"))
-            ok, buf = cv2.imencode(".png", self.last_frame)
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
             if ok:
-                buf.tofile(name)
+                with self.lock:
+                    self.frame = frame
+                    self.jpeg = buf.tobytes()
 
-    def close(self):
-        self.cap.release()
-        self.window.destroy()
+    def get_jpeg(self):
+        with self.lock:
+            return self.jpeg
+
+    def get_png(self):
+        with self.lock:
+            frame = None if self.frame is None else self.frame.copy()
+        if frame is None:
+            return None
+        ok, buf = cv2.imencode(".png", frame)
+        return buf.tobytes() if ok else None
+
+
+PAGE = """
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Маски для камеры</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background:
+    radial-gradient(circle at 15% 10%, rgba(37, 99, 235, 0.25), transparent 45%),
+    radial-gradient(circle at 85% 90%, rgba(29, 78, 216, 0.22), transparent 45%),
+    #04060c;
+  color: #dbe7ff;
+  font-family: "Segoe UI", Arial, sans-serif;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#stage {
+  position: relative;
+  width: min(96vw, 160vh * 0.75);
+  aspect-ratio: 4 / 3;
+  max-height: 96vh;
+  background: #000;
+  border: 1px solid #1e3a8a;
+  border-radius: 20px;
+  overflow: hidden;
+  box-shadow: 0 0 40px rgba(37, 99, 235, 0.35), 0 0 120px rgba(29, 78, 216, 0.18);
+}
+#stage:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  max-height: none;
+  aspect-ratio: auto;
+  border: none;
+  border-radius: 0;
+}
+#video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+#flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+#flash.on { animation: flash 0.35s ease-out; }
+@keyframes flash { from { opacity: 0.9; } to { opacity: 0; } }
+.top {
+  position: absolute; top: 0; left: 0; right: 0;
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 16px 18px;
+  background: linear-gradient(to bottom, rgba(2, 6, 23, 0.75), transparent);
+}
+.title { font-weight: 600; letter-spacing: 0.04em; color: #93c5fd; text-shadow: 0 0 12px rgba(59, 130, 246, 0.8); }
+.icon-btn {
+  width: 42px; height: 42px; border-radius: 12px;
+  background: rgba(15, 30, 70, 0.7);
+  border: 1px solid #1d4ed8;
+  color: #bfdbfe; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: 0.2s;
+}
+.icon-btn:hover { background: #1d4ed8; box-shadow: 0 0 16px rgba(59, 130, 246, 0.7); }
+.icon-btn svg { width: 22px; height: 22px; }
+.bottom {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 18px 18px 22px;
+  display: flex; flex-direction: column; align-items: center; gap: 16px;
+  background: linear-gradient(to top, rgba(2, 6, 23, 0.85), transparent);
+}
+.chips { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+.chip {
+  padding: 9px 18px; border-radius: 999px;
+  background: rgba(15, 30, 70, 0.7);
+  border: 1px solid #1e40af;
+  color: #bfdbfe; cursor: pointer; font-size: 14px; transition: 0.2s;
+}
+.chip:hover { border-color: #60a5fa; }
+.chip.active {
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  border-color: #60a5fa; color: #fff;
+  box-shadow: 0 0 18px rgba(59, 130, 246, 0.75);
+}
+.row { width: 100%; display: flex; align-items: center; justify-content: center; position: relative; }
+#shutter {
+  width: 78px; height: 78px; border-radius: 50%;
+  background: transparent;
+  border: 4px solid #dbeafe;
+  padding: 5px; cursor: pointer;
+  box-shadow: 0 0 24px rgba(59, 130, 246, 0.8);
+  transition: transform 0.12s;
+}
+#shutter span { display: block; width: 100%; height: 100%; border-radius: 50%; background: #fff; transition: 0.12s; }
+#shutter:hover span { background: #bfdbfe; }
+#shutter:active { transform: scale(0.92); }
+#shutter:active span { background: #60a5fa; }
+#thumb {
+  position: absolute; left: 4px; bottom: 4px;
+  width: 58px; height: 58px; border-radius: 12px;
+  border: 2px solid #2563eb; object-fit: cover;
+  display: none; cursor: pointer;
+  box-shadow: 0 0 14px rgba(37, 99, 235, 0.7);
+}
+</style>
+</head>
+<body>
+<div id="stage">
+  <img id="video" src="/video" alt="">
+  <div id="flash"></div>
+  <div class="top">
+    <div class="title">МАСКИ</div>
+    <button class="icon-btn" id="full" title="На весь экран (F)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>
+      </svg>
+    </button>
+  </div>
+  <div class="bottom">
+    <div class="chips">
+      <button class="chip active" data-mask="none">Без маски</button>
+      {% for key, title in masks %}
+      <button class="chip" data-mask="{{ key }}">{{ title }}</button>
+      {% endfor %}
+    </div>
+    <div class="row">
+      <img id="thumb" alt="">
+      <button id="shutter" title="Фото (Пробел)"><span></span></button>
+    </div>
+  </div>
+</div>
+<script>
+const stage = document.getElementById('stage');
+const chips = document.querySelectorAll('.chip');
+const flash = document.getElementById('flash');
+const thumb = document.getElementById('thumb');
+let lastUrl = null;
+
+chips.forEach(chip => {
+  chip.addEventListener('click', () => {
+    chips.forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    fetch('/mask/' + chip.dataset.mask, { method: 'POST' });
+  });
+});
+
+function toggleFull() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    stage.requestFullscreen();
+  }
+}
+
+async function shoot() {
+  flash.classList.remove('on');
+  void flash.offsetWidth;
+  flash.classList.add('on');
+  const res = await fetch('/snapshot');
+  if (!res.ok) return;
+  const blob = await res.blob();
+  if (lastUrl) URL.revokeObjectURL(lastUrl);
+  lastUrl = URL.createObjectURL(blob);
+  thumb.src = lastUrl;
+  thumb.style.display = 'block';
+  const a = document.createElement('a');
+  a.href = lastUrl;
+  a.download = 'photo_' + Date.now() + '.png';
+  a.click();
+}
+
+thumb.addEventListener('click', () => window.open(lastUrl, '_blank'));
+document.getElementById('full').addEventListener('click', toggleFull);
+document.getElementById('shutter').addEventListener('click', shoot);
+document.addEventListener('keydown', e => {
+  if (e.key === 'f' || e.key === 'F' || e.key === 'а' || e.key === 'А') toggleFull();
+  if (e.code === 'Space') { e.preventDefault(); shoot(); }
+});
+</script>
+</body>
+</html>
+"""
+
+app = Flask(__name__)
+camera = Camera()
+
+
+@app.route("/")
+def index():
+    masks = [(k, v["title"]) for k, v in MASKS.items()]
+    return render_template_string(PAGE, masks=masks)
+
+
+@app.route("/video")
+def video():
+    def stream():
+        while True:
+            jpg = camera.get_jpeg()
+            if jpg is not None:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            time.sleep(0.03)
+
+    return Response(stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/mask/<key>", methods=["POST"])
+def set_mask(key):
+    if key == "none":
+        camera.current = None
+    elif key in MASKS:
+        camera.current = key
+    else:
+        abort(404)
+    return ("", 204)
+
+
+@app.route("/snapshot")
+def snapshot():
+    png = camera.get_png()
+    if png is None:
+        abort(503)
+    return Response(png, mimetype="image/png")
 
 
 if __name__ == "__main__":
-    app_window = tk.Tk()
-    App(app_window)
-    app_window.mainloop()
+    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
+    app.run(host="127.0.0.1", port=5000, threaded=True)
