@@ -4,6 +4,7 @@ import os
 import shutil
 import threading
 import time
+import urllib.request
 import webbrowser
 
 import cv2
@@ -12,11 +13,18 @@ from flask import Flask, Response, abort, render_template_string
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_FACES = 2
+HOLD_TIME = 1.5
+
+WIG_WIDTH = 3.4
+WIG_LIFT = 0.5
+NOSE_SIZE = 0.62
+
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 
-def make_detector():
+def make_haar():
     cv_dir = os.path.dirname(cv2.__file__)
     src = os.path.join(cv_dir, "data", "haarcascade_frontalface_default.xml")
     dst_dir = r"C:\cascades"
@@ -25,6 +33,28 @@ def make_detector():
     if not os.path.exists(dst):
         shutil.copy(src, dst)
     return cv2.CascadeClassifier(dst)
+
+
+def make_yunet():
+    dst_dir = r"C:\cascades"
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, "yunet.onnx")
+    if not os.path.exists(dst) or os.path.getsize(dst) < 100000:
+        try:
+            req = urllib.request.Request(YUNET_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = response.read()
+            with open(dst, "wb") as f:
+                f.write(data)
+        except Exception:
+            print("Не удалось скачать модель лица. Скачай файл вручную:")
+            print(YUNET_URL)
+            print("и положи его сюда:", dst)
+            return None
+    try:
+        return cv2.FaceDetectorYN.create(dst, "", (320, 320), 0.6, 0.3, 5000)
+    except Exception:
+        return None
 
 
 def find_file(*names):
@@ -85,6 +115,29 @@ def overlay(frame, sprite, cx, cy, size, smooth=False):
     frame[y1:y2, x1:x2] = (part[:, :, :3] * a + roi * (1 - a)).astype(np.uint8)
 
 
+def rotate_sprite(sprite, angle):
+    h, w = sprite.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    cos, sin = abs(m[0, 0]), abs(m[0, 1])
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+    m[0, 2] += new_w / 2 - w / 2
+    m[1, 2] += new_h / 2 - h / 2
+    return cv2.warpAffine(sprite, m, (new_w, new_h), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+
+
+def draw_sprite(frame, sprite, cx, cy, width, angle=0.0):
+    h0, w0 = sprite.shape[:2]
+    new_w = max(int(width), 4)
+    new_h = max(int(width * h0 / w0), 1)
+    interp = cv2.INTER_AREA if new_w < w0 else cv2.INTER_LINEAR
+    s = cv2.resize(sprite, (new_w, new_h), interpolation=interp)
+    if abs(angle) > 0.5:
+        s = rotate_sprite(s, angle)
+    overlay(frame, s, cx, cy, s.shape[1], smooth=True)
+
+
 HEARTS_LAYOUT = [
     (155, 0.96, 0.13, 0.0),
     (140, 1.10, 0.10, 1.0),
@@ -103,10 +156,24 @@ MASKS = {
 }
 
 
+def get_pose(p):
+    right_eye = p[4:6]
+    left_eye = p[6:8]
+    nose = p[8:10]
+    mid = (right_eye + left_eye) / 2
+    d = left_eye - right_eye
+    eye_dist = max(float(np.hypot(d[0], d[1])), 1.0)
+    roll = math.atan2(float(d[1]), float(d[0]))
+    roll = max(-0.8, min(0.8, roll))
+    up = np.array([math.sin(roll), -math.cos(roll)], dtype=np.float32)
+    return mid, nose, eye_dist, roll, up
+
+
 class Camera:
     def __init__(self):
         self.cap = cv2.VideoCapture(0)
-        self.detector = make_detector()
+        self.yunet = make_yunet()
+        self.haar = None if self.yunet is not None else make_haar()
         self.sprites = {
             "heart": load_sprite(find_file("heart.png", "hurts.png")),
             "clown_nose": load_sprite(find_file("clownose.png"), soft=True),
@@ -114,82 +181,115 @@ class Camera:
         }
         self.current = None
         self.tracks = []
+        self.next_id = 0
         self.frame = None
         self.jpeg = None
         self.lock = threading.Lock()
         threading.Thread(target=self.run, daemon=True).start()
 
-    def detect_faces(self, frame):
+    def detect_raw(self, frame):
+        h, w = frame.shape[:2]
+        if self.yunet is not None:
+            sw = 640
+            scale = sw / w
+            sh = int(h * scale)
+            small = cv2.resize(frame, (sw, sh))
+            self.yunet.setInputSize((sw, sh))
+            _, faces = self.yunet.detect(small)
+            if faces is None:
+                return []
+            return [f[:14].astype(np.float32) / scale for f in faces]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         scale = 0.5
         small = cv2.resize(gray, None, fx=scale, fy=scale)
-        faces = self.detector.detectMultiScale(small, 1.1, 5, minSize=(50, 50))
-        now = time.time()
-        found = [np.array(f, dtype=np.float32) / scale for f in faces]
-        found.sort(key=lambda b: b[2] * b[3], reverse=True)
-        found = found[:MAX_FACES]
+        faces = self.haar.detectMultiScale(small, 1.1, 4, minSize=(50, 50))
+        result = []
+        for f in faces:
+            x, y, fw, fh = [float(v) / scale for v in f]
+            result.append(np.array([
+                x, y, fw, fh,
+                x + 0.30 * fw, y + 0.40 * fh,
+                x + 0.70 * fw, y + 0.40 * fh,
+                x + 0.50 * fw, y + 0.62 * fh,
+                x + 0.35 * fw, y + 0.80 * fh,
+                x + 0.65 * fw, y + 0.80 * fh,
+            ], dtype=np.float32))
+        return result
+
+    def update_tracks(self, detections, now):
+        detections.sort(key=lambda d: d[2] * d[3], reverse=True)
         used = set()
-        for box in found:
-            cx = box[0] + box[2] / 2
-            cy = box[1] + box[3] / 2
+        for det in detections[:MAX_FACES]:
+            center = det[:2] + det[2:4] / 2
             best = None
             best_dist = None
             for i, track in enumerate(self.tracks):
                 if i in used:
                     continue
-                tb = track["box"]
-                dist = math.hypot(cx - (tb[0] + tb[2] / 2), cy - (tb[1] + tb[3] / 2))
-                if dist < max(tb[2], box[2]) and (best_dist is None or dist < best_dist):
+                tp = track["p"]
+                tc = tp[:2] + tp[2:4] / 2
+                dist = float(np.hypot(center[0] - tc[0], center[1] - tc[1]))
+                if dist < max(tp[2], det[2]) * 1.2 and (best_dist is None or dist < best_dist):
                     best = i
                     best_dist = dist
             if best is None:
-                self.tracks.append({"box": box, "seen": now})
+                self.tracks.append({"id": self.next_id, "p": det.copy(), "seen": now})
+                self.next_id += 1
                 used.add(len(self.tracks) - 1)
             else:
                 track = self.tracks[best]
-                track["box"] = track["box"] * 0.7 + box * 0.3
+                motion = best_dist / max(track["p"][2], 1.0)
+                alpha = min(0.9, 0.35 + motion * 2.0)
+                track["p"] = track["p"] * (1 - alpha) + det * alpha
                 track["seen"] = now
                 used.add(best)
-        alive = [t for t in self.tracks if now - t["seen"] <= 0.6]
+        alive = [t for t in self.tracks if now - t["seen"] <= HOLD_TIME]
         alive.sort(key=lambda t: t["seen"], reverse=True)
         self.tracks = alive[:MAX_FACES]
 
-    def draw_hearts(self, frame, box, index, now):
-        x, y, w, h = box
+    def draw_hearts(self, frame, track, now):
+        mid, nose, eye_dist, roll, up = get_pose(track["p"])
         sprite = self.sprites["heart"]
-        cx = x + w / 2
-        cy = y + h * 0.25
+        anchor = mid + up * eye_dist * 0.15
+        w = eye_dist * 2.2
+        h = eye_dist * 2.4
         rx = w * 0.72
         ry = h * 0.78
-        t = now * 2.0 + index * 1.7
+        cos_r, sin_r = math.cos(roll), math.sin(roll)
+        t = now * 2.0 + track["id"] * 1.7
         for angle, radial, size, phase in HEARTS_LAYOUT:
             a = math.radians(angle)
-            px = cx + rx * radial * math.cos(a)
-            py = cy - ry * radial * math.sin(a) + math.sin(t + phase) * h * 0.02
+            lx = rx * radial * math.cos(a)
+            ly = -ry * radial * math.sin(a) + math.sin(t + phase) * h * 0.02
+            px = anchor[0] + lx * cos_r - ly * sin_r
+            py = anchor[1] + lx * sin_r + ly * cos_r
             overlay(frame, sprite, px, py, w * size)
 
-    def draw_clown(self, frame, box):
-        x, y, w, h = box
-        cx = x + w / 2
+    def draw_clown(self, frame, track):
+        mid, nose, eye_dist, roll, up = get_pose(track["p"])
+        angle = -math.degrees(roll)
         hair = self.sprites["clown_hair"]
-        hair_w = w * 1.5
+        hair_w = eye_dist * WIG_WIDTH
         hair_h = hair_w * hair.shape[0] / hair.shape[1]
-        hair_bottom = y + h * 0.12
-        overlay(frame, hair, cx, hair_bottom - hair_h / 2, hair_w, smooth=True)
-        overlay(frame, self.sprites["clown_nose"], cx, y + h * 0.62, w * 0.22, smooth=True)
+        bottom = mid + up * eye_dist * WIG_LIFT
+        center = bottom + up * hair_h / 2
+        draw_sprite(frame, hair, center[0], center[1], hair_w, angle)
+        nose_center = nose - up * eye_dist * 0.05
+        draw_sprite(frame, self.sprites["clown_nose"], nose_center[0], nose_center[1],
+                    eye_dist * NOSE_SIZE)
 
     def draw_mask(self, frame):
         current = self.current
         if current is None:
             return
         now = time.time()
-        for index, track in enumerate(list(self.tracks)):
-            if now - track["seen"] > 0.6:
+        for track in list(self.tracks):
+            if now - track["seen"] > HOLD_TIME:
                 continue
             if current == "pink_hearts":
-                self.draw_hearts(frame, track["box"], index, now)
+                self.draw_hearts(frame, track, now)
             elif current == "clown":
-                self.draw_clown(frame, track["box"])
+                self.draw_clown(frame, track)
 
     def run(self):
         while True:
@@ -198,7 +298,7 @@ class Camera:
                 time.sleep(0.05)
                 continue
             frame = cv2.flip(frame, 1)
-            self.detect_faces(frame)
+            self.update_tracks(self.detect_raw(frame), time.time())
             self.draw_mask(frame)
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
             if ok:
