@@ -1,4 +1,3 @@
-import glob
 import logging
 import math
 import os
@@ -28,19 +27,15 @@ def make_detector():
     return cv2.CascadeClassifier(dst)
 
 
-def find_sprite():
-    for name in ("heart.png", "hurts.png"):
+def find_file(*names):
+    for name in names:
         path = os.path.join(BASE_DIR, name)
         if os.path.exists(path):
             return path
-    files = [f for f in glob.glob(os.path.join(BASE_DIR, "*.png"))
-             if not os.path.basename(f).startswith("photo_")]
-    if files:
-        return files[0]
-    raise SystemExit("Положи картинку сердца heart.png рядом с main.py")
+    raise SystemExit("Положи рядом с main.py файл: " + " или ".join(names))
 
 
-def load_sprite(path):
+def load_sprite(path, soft=False):
     img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(path)
@@ -55,17 +50,26 @@ def load_sprite(path):
         flags = 4 | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
         cv2.floodFill(bgr.copy(), mask, (0, 0), (0, 0, 0), (12, 12, 12), (12, 12, 12), flags)
         alpha = np.where(mask[1:-1, 1:-1] == 255, 0, 255).astype(np.uint8)
+        if soft:
+            alpha = cv2.erode(alpha, np.ones((3, 3), np.uint8), iterations=1)
+            alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
     sprite = np.dstack([bgr, alpha])
     ys, xs = np.where(sprite[:, :, 3] > 10)
     return sprite[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
 
-def overlay(frame, sprite, cx, cy, size):
+def overlay(frame, sprite, cx, cy, size, smooth=False):
     size = max(int(size), 4)
     h0, w0 = sprite.shape[:2]
     new_w = size
-    new_h = int(size * h0 / w0)
-    s = cv2.resize(sprite, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    new_h = max(int(size * h0 / w0), 1)
+    if not smooth:
+        interp = cv2.INTER_NEAREST
+    elif new_w < w0:
+        interp = cv2.INTER_AREA
+    else:
+        interp = cv2.INTER_LINEAR
+    s = cv2.resize(sprite, (new_w, new_h), interpolation=interp)
     x1, y1 = int(cx - new_w / 2), int(cy - new_h / 2)
     x2, y2 = x1 + new_w, y1 + new_h
     fh, fw = frame.shape[:2]
@@ -94,11 +98,8 @@ HEARTS_LAYOUT = [
 ]
 
 MASKS = {
-    "pink_hearts": {
-        "title": "Розовые сердца",
-        "sprite": find_sprite(),
-        "layout": HEARTS_LAYOUT,
-    },
+    "pink_hearts": {"title": "Розовые сердца"},
+    "clown": {"title": "Клоун"},
 }
 
 
@@ -106,7 +107,11 @@ class Camera:
     def __init__(self):
         self.cap = cv2.VideoCapture(0)
         self.detector = make_detector()
-        self.sprites = {k: load_sprite(v["sprite"]) for k, v in MASKS.items()}
+        self.sprites = {
+            "heart": load_sprite(find_file("heart.png", "hurts.png")),
+            "clown_nose": load_sprite(find_file("clownose.png"), soft=True),
+            "clown_hair": load_sprite(find_file("clownhair.png"), soft=True),
+        }
         self.current = None
         self.tracks = []
         self.frame = None
@@ -149,27 +154,42 @@ class Camera:
         alive.sort(key=lambda t: t["seen"], reverse=True)
         self.tracks = alive[:MAX_FACES]
 
+    def draw_hearts(self, frame, box, index, now):
+        x, y, w, h = box
+        sprite = self.sprites["heart"]
+        cx = x + w / 2
+        cy = y + h * 0.25
+        rx = w * 0.72
+        ry = h * 0.78
+        t = now * 2.0 + index * 1.7
+        for angle, radial, size, phase in HEARTS_LAYOUT:
+            a = math.radians(angle)
+            px = cx + rx * radial * math.cos(a)
+            py = cy - ry * radial * math.sin(a) + math.sin(t + phase) * h * 0.02
+            overlay(frame, sprite, px, py, w * size)
+
+    def draw_clown(self, frame, box):
+        x, y, w, h = box
+        cx = x + w / 2
+        hair = self.sprites["clown_hair"]
+        hair_w = w * 1.5
+        hair_h = hair_w * hair.shape[0] / hair.shape[1]
+        hair_bottom = y + h * 0.12
+        overlay(frame, hair, cx, hair_bottom - hair_h / 2, hair_w, smooth=True)
+        overlay(frame, self.sprites["clown_nose"], cx, y + h * 0.62, w * 0.22, smooth=True)
+
     def draw_mask(self, frame):
         current = self.current
         if current is None:
             return
         now = time.time()
-        sprite = self.sprites[current]
-        layout = MASKS[current]["layout"]
         for index, track in enumerate(list(self.tracks)):
             if now - track["seen"] > 0.6:
                 continue
-            x, y, w, h = track["box"]
-            cx = x + w / 2
-            cy = y + h * 0.25
-            rx = w * 0.72
-            ry = h * 0.78
-            t = now * 2.0 + index * 1.7
-            for angle, radial, size, phase in layout:
-                a = math.radians(angle)
-                px = cx + rx * radial * math.cos(a)
-                py = cy - ry * radial * math.sin(a) + math.sin(t + phase) * h * 0.02
-                overlay(frame, sprite, px, py, w * size)
+            if current == "pink_hearts":
+                self.draw_hearts(frame, track["box"], index, now)
+            elif current == "clown":
+                self.draw_clown(frame, track["box"])
 
     def run(self):
         while True:
@@ -267,19 +287,40 @@ body {
   display: flex; flex-direction: column; align-items: center; gap: 16px;
   background: linear-gradient(to top, rgba(2, 6, 23, 0.85), transparent);
 }
-.chips { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
-.chip {
-  padding: 9px 18px; border-radius: 999px;
-  background: rgba(15, 30, 70, 0.7);
-  border: 1px solid #1e40af;
-  color: #bfdbfe; cursor: pointer; font-size: 14px; transition: 0.2s;
+.dropdown { position: relative; }
+#menuBtn {
+  min-width: 220px;
+  padding: 10px 18px; border-radius: 999px;
+  background: rgba(15, 30, 70, 0.8);
+  border: 1px solid #2563eb;
+  color: #dbeafe; cursor: pointer; font-size: 15px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  box-shadow: 0 0 16px rgba(37, 99, 235, 0.5);
+  transition: 0.2s;
 }
-.chip:hover { border-color: #60a5fa; }
-.chip.active {
-  background: linear-gradient(135deg, #2563eb, #1d4ed8);
-  border-color: #60a5fa; color: #fff;
-  box-shadow: 0 0 18px rgba(59, 130, 246, 0.75);
+#menuBtn:hover { border-color: #60a5fa; box-shadow: 0 0 22px rgba(59, 130, 246, 0.8); }
+#menuBtn svg { width: 16px; height: 16px; transition: transform 0.2s; }
+.dropdown.open #menuBtn svg { transform: rotate(180deg); }
+#menu {
+  position: absolute; left: 0; right: 0; bottom: calc(100% + 10px);
+  background: rgba(5, 12, 35, 0.95);
+  border: 1px solid #1d4ed8;
+  border-radius: 16px;
+  padding: 6px;
+  display: none;
+  box-shadow: 0 0 28px rgba(37, 99, 235, 0.55);
+  backdrop-filter: blur(8px);
 }
+.dropdown.open #menu { display: block; }
+.opt {
+  width: 100%;
+  padding: 10px 14px; border-radius: 10px;
+  background: transparent; border: none;
+  color: #bfdbfe; cursor: pointer; font-size: 15px; text-align: left;
+  transition: 0.15s;
+}
+.opt:hover { background: rgba(37, 99, 235, 0.35); }
+.opt.active { background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }
 .row { width: 100%; display: flex; align-items: center; justify-content: center; position: relative; }
 #shutter {
   width: 78px; height: 78px; border-radius: 50%;
@@ -315,11 +356,19 @@ body {
     </button>
   </div>
   <div class="bottom">
-    <div class="chips">
-      <button class="chip active" data-mask="none">Без маски</button>
-      {% for key, title in masks %}
-      <button class="chip" data-mask="{{ key }}">{{ title }}</button>
-      {% endfor %}
+    <div class="dropdown" id="dropdown">
+      <div id="menu">
+        <button class="opt active" data-mask="none">Без маски</button>
+        {% for key, title in masks %}
+        <button class="opt" data-mask="{{ key }}">{{ title }}</button>
+        {% endfor %}
+      </div>
+      <button id="menuBtn">
+        <span id="menuLabel">Маски</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 15l6-6 6 6"/>
+        </svg>
+      </button>
     </div>
     <div class="row">
       <img id="thumb" alt="">
@@ -329,16 +378,28 @@ body {
 </div>
 <script>
 const stage = document.getElementById('stage');
-const chips = document.querySelectorAll('.chip');
+const dropdown = document.getElementById('dropdown');
+const menuBtn = document.getElementById('menuBtn');
+const menuLabel = document.getElementById('menuLabel');
+const opts = document.querySelectorAll('.opt');
 const flash = document.getElementById('flash');
 const thumb = document.getElementById('thumb');
 let lastUrl = null;
 
-chips.forEach(chip => {
-  chip.addEventListener('click', () => {
-    chips.forEach(c => c.classList.remove('active'));
-    chip.classList.add('active');
-    fetch('/mask/' + chip.dataset.mask, { method: 'POST' });
+menuBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  dropdown.classList.toggle('open');
+});
+
+document.addEventListener('click', () => dropdown.classList.remove('open'));
+
+opts.forEach(opt => {
+  opt.addEventListener('click', () => {
+    opts.forEach(o => o.classList.remove('active'));
+    opt.classList.add('active');
+    menuLabel.textContent = opt.dataset.mask === 'none' ? 'Маски' : opt.textContent;
+    dropdown.classList.remove('open');
+    fetch('/mask/' + opt.dataset.mask, { method: 'POST' });
   });
 });
 
@@ -373,6 +434,7 @@ document.getElementById('shutter').addEventListener('click', shoot);
 document.addEventListener('keydown', e => {
   if (e.key === 'f' || e.key === 'F' || e.key === 'а' || e.key === 'А') toggleFull();
   if (e.code === 'Space') { e.preventDefault(); shoot(); }
+  if (e.key === 'Escape') dropdown.classList.remove('open');
 });
 </script>
 </body>
