@@ -266,11 +266,46 @@ body {
 @keyframes flash { from { opacity: 0.9; } to { opacity: 0; } }
 .top {
   position: absolute; top: 0; left: 0; right: 0;
-  display: flex; justify-content: space-between; align-items: center;
+  display: flex; justify-content: space-between; align-items: flex-start;
   padding: 16px 18px;
   background: linear-gradient(to bottom, rgba(2, 6, 23, 0.75), transparent);
+  z-index: 5;
 }
-.title { font-weight: 600; letter-spacing: 0.04em; color: #93c5fd; text-shadow: 0 0 12px rgba(59, 130, 246, 0.8); }
+.dropdown { position: relative; }
+#menuBtn {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 16px; border-radius: 12px;
+  background: rgba(15, 30, 70, 0.55);
+  border: 1px solid #1d4ed8;
+  color: #93c5fd; cursor: pointer;
+  font-family: inherit; font-size: 16px; font-weight: 600; letter-spacing: 0.04em;
+  text-shadow: 0 0 12px rgba(59, 130, 246, 0.8);
+  transition: 0.2s;
+}
+#menuBtn:hover { background: rgba(29, 78, 216, 0.5); box-shadow: 0 0 16px rgba(59, 130, 246, 0.7); }
+#menuBtn svg { width: 16px; height: 16px; transition: transform 0.2s; }
+.dropdown.open #menuBtn svg { transform: rotate(180deg); }
+#menu {
+  position: absolute; left: 0; top: calc(100% + 8px);
+  min-width: 210px;
+  background: rgba(5, 12, 35, 0.95);
+  border: 1px solid #1d4ed8;
+  border-radius: 14px;
+  padding: 6px;
+  display: none;
+  box-shadow: 0 0 28px rgba(37, 99, 235, 0.55);
+  backdrop-filter: blur(8px);
+}
+.dropdown.open #menu { display: block; }
+.opt {
+  width: 100%; display: block;
+  padding: 10px 14px; border-radius: 10px;
+  background: transparent; border: none;
+  color: #bfdbfe; cursor: pointer; font-size: 15px; text-align: left;
+  transition: 0.15s;
+}
+.opt:hover { background: rgba(37, 99, 235, 0.35); }
+.opt.active { background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }
 .icon-btn {
   width: 42px; height: 42px; border-radius: 12px;
   background: rgba(15, 30, 70, 0.7);
@@ -287,40 +322,6 @@ body {
   display: flex; flex-direction: column; align-items: center; gap: 16px;
   background: linear-gradient(to top, rgba(2, 6, 23, 0.85), transparent);
 }
-.dropdown { position: relative; }
-#menuBtn {
-  min-width: 220px;
-  padding: 10px 18px; border-radius: 999px;
-  background: rgba(15, 30, 70, 0.8);
-  border: 1px solid #2563eb;
-  color: #dbeafe; cursor: pointer; font-size: 15px;
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  box-shadow: 0 0 16px rgba(37, 99, 235, 0.5);
-  transition: 0.2s;
-}
-#menuBtn:hover { border-color: #60a5fa; box-shadow: 0 0 22px rgba(59, 130, 246, 0.8); }
-#menuBtn svg { width: 16px; height: 16px; transition: transform 0.2s; }
-.dropdown.open #menuBtn svg { transform: rotate(180deg); }
-#menu {
-  position: absolute; left: 0; right: 0; bottom: calc(100% + 10px);
-  background: rgba(5, 12, 35, 0.95);
-  border: 1px solid #1d4ed8;
-  border-radius: 16px;
-  padding: 6px;
-  display: none;
-  box-shadow: 0 0 28px rgba(37, 99, 235, 0.55);
-  backdrop-filter: blur(8px);
-}
-.dropdown.open #menu { display: block; }
-.opt {
-  width: 100%;
-  padding: 10px 14px; border-radius: 10px;
-  background: transparent; border: none;
-  color: #bfdbfe; cursor: pointer; font-size: 15px; text-align: left;
-  transition: 0.15s;
-}
-.opt:hover { background: rgba(37, 99, 235, 0.35); }
-.opt.active { background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }
 .row { width: 100%; display: flex; align-items: center; justify-content: center; position: relative; }
 #shutter {
   width: 78px; height: 78px; border-radius: 50%;
@@ -348,7 +349,20 @@ body {
   <img id="video" src="/video" alt="">
   <div id="flash"></div>
   <div class="top">
-    <div class="title">МАСКИ</div>
+    <div class="dropdown" id="dropdown">
+      <button id="menuBtn">
+        <span>МАСКИ</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 9l6 6 6-6"/>
+        </svg>
+      </button>
+      <div id="menu">
+        <button class="opt active" data-mask="none">Без маски</button>
+        {% for key, title in masks %}
+        <button class="opt" data-mask="{{ key }}">{{ title }}</button>
+        {% endfor %}
+      </div>
+    </div>
     <button class="icon-btn" id="full" title="На весь экран (F)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>
@@ -356,20 +370,6 @@ body {
     </button>
   </div>
   <div class="bottom">
-    <div class="dropdown" id="dropdown">
-      <div id="menu">
-        <button class="opt active" data-mask="none">Без маски</button>
-        {% for key, title in masks %}
-        <button class="opt" data-mask="{{ key }}">{{ title }}</button>
-        {% endfor %}
-      </div>
-      <button id="menuBtn">
-        <span id="menuLabel">Маски</span>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M6 15l6-6 6 6"/>
-        </svg>
-      </button>
-    </div>
     <div class="row">
       <img id="thumb" alt="">
       <button id="shutter" title="Фото (Пробел)"><span></span></button>
@@ -380,7 +380,6 @@ body {
 const stage = document.getElementById('stage');
 const dropdown = document.getElementById('dropdown');
 const menuBtn = document.getElementById('menuBtn');
-const menuLabel = document.getElementById('menuLabel');
 const opts = document.querySelectorAll('.opt');
 const flash = document.getElementById('flash');
 const thumb = document.getElementById('thumb');
@@ -397,7 +396,6 @@ opts.forEach(opt => {
   opt.addEventListener('click', () => {
     opts.forEach(o => o.classList.remove('active'));
     opt.classList.add('active');
-    menuLabel.textContent = opt.dataset.mask === 'none' ? 'Маски' : opt.textContent;
     dropdown.classList.remove('open');
     fetch('/mask/' + opt.dataset.mask, { method: 'POST' });
   });
